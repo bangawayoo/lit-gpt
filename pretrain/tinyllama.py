@@ -1,17 +1,24 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 """
+TODO:
+ - estimate training time and amount of tokens 
+
+"""
+"""
 This script is adapted from TinyLlama:
 https://github.com/jzhang38/TinyLlama/blob/main/pretrain/tinyllama.py
 """
 
+import glob
 import math
 import os
+import random
 import sys
 import time
 from functools import partial
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional
 
 import lightning as L
 import torch
@@ -27,22 +34,25 @@ from torchmetrics.aggregation import RunningMean
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
+
 from lit_gpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
-from lit_gpt.packed_dataset import CombinedDataset
-from lit_gpt.utils import CycleIterator, chunked_cross_entropy, num_parameters
+from lit_gpt.packed_dataset import CombinedDataset, PackedDataset
+from lit_gpt.utils import CycleIterator, chunked_cross_entropy, num_parameters, load_checkpoint
 
 # System settings
-model_name = "tiny-llama-1.1b"
-name = "lit-tiny-llama-1.1b"
+model_name = "phi-2"
+name = "lit-phi-2"
+checkpoint_path = "checkpoints/microsoft/phi-2/lit_model.pth"
 out_dir = Path(os.getenv("LIGHTNING_ARTIFACTS_DIR", "out")) / name
-logger_name = "tensorboard"
+logger_name = "wandb"
 devices = torch.cuda.device_count() or 1
+
 
 # Hyperparameters
 global_batch_size = 512
 learning_rate = 4e-4
 micro_batch_size = 4
-max_tokens = int(3e12)  # 3 trillion
+max_tokens = int(1639 * 2048 * 1024 * 5) # 1639 chunks * 2048 tokens * 1024 samples * 5 epochs
 warmup_steps = 2000
 log_step_interval = 1
 eval_iters = 100
@@ -86,7 +96,7 @@ def main(fabric, resume):
 
     config = Config.from_name(model_name)
 
-    train_dataloader, val_dataloader = create_dataloaders(batch_size=micro_batch_size, block_size=config.block_size)
+    train_dataloader, val_dataloader = create_dataloaders(batch_size=micro_batch_size, block_size=config.block_size, fabric=fabric)
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
     fabric.seed_everything(3407)  # same seed for every process to init model (FSDP)
@@ -100,8 +110,12 @@ def main(fabric, resume):
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
-    model = torch.compile(model)
     model = fabric.setup(model)
+    fabric.load_raw(checkpoint_path, model, strict=True)
+    # model = torch.compile(model, mode="reduce-overhead")
+    # load_checkpoint(fabric, model, checkpoint_path, strict=True)
+
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), fused=True
     )
@@ -218,8 +232,10 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             fabric.print(
                 f"iter {metrics['iter']} | step {metrics['step']}: loss {metrics['loss']:.4f}, iter time:"
                 f" {metrics['iter_time'] * 1000:.2f} ms{' (optimizer.step),' if not is_accumulating else ','}"
-                f" remaining time: {metrics['remaining_time'] / 3600 / 24:.2f} days"
+                f" remaining time: {metrics['remaining_time'] / 3600:.2f} hours. " 
+                f" or {metrics['remaining_time'] / 3600 / 24:.2f} days"
             )
+
 
             throughput_metrics = throughput.compute()
             metrics.update(throughput_metrics)
@@ -240,6 +256,22 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             checkpoint_path = out_dir / f"step-{state['step_count']:08d}.pth"
             fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
             fabric.save(checkpoint_path, state)
+    
+    if val_dataloader is not None:
+        t0 = time.perf_counter()
+        val_loss = validate(fabric, model, val_dataloader, max_iters=eval_iters)
+        val_loss = val_loss.item()
+        td = time.perf_counter() - t0
+
+        fabric.print(f"Last iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
+        metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+        fabric.log_dict(metrics, step=state["iter_num"])
+        fabric.barrier()
+
+    # save last checkpoint
+    checkpoint_path = out_dir / f"last-step-{state['step_count']:08d}.pth"
+    fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
+    fabric.save(checkpoint_path, state)
 
 
 @torch.no_grad()
@@ -261,7 +293,7 @@ def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max
     return losses.mean()
 
 
-def create_dataloaders(batch_size: int, block_size: int) -> Tuple[DataLoader, DataLoader]:
+# def create_dataloaders(batch_size: int, block_size: int) -> Tuple[DataLoader, DataLoader]:
     from lightning.data import StreamingDataset
     from lightning.data.streaming.item_loader import TokensLoader
 
@@ -270,13 +302,7 @@ def create_dataloaders(batch_size: int, block_size: int) -> Tuple[DataLoader, Da
 
     train_datasets = [
         StreamingDataset(
-            input_dir="data/slimpajama/train",
-            item_loader=TokensLoader(block_size=effective_block_size),
-            shuffle=True,
-            drop_last=True,
-        ),
-        StreamingDataset(
-            input_dir="data/starcoder",
+            input_dir="../data/pubmed/processed/train",
             item_loader=TokensLoader(block_size=effective_block_size),
             shuffle=True,
             drop_last=True,
@@ -284,20 +310,103 @@ def create_dataloaders(batch_size: int, block_size: int) -> Tuple[DataLoader, Da
     ]
 
     # Mix SlimPajama data and Starcoder data with these proportions:
-    weights = (0.693584, 0.306416)
+    weights = (1.0, )
     combined_dataset = CombinedDataset(datasets=train_datasets, seed=42, weights=weights)
     train_dataloader = DataLoader(
         combined_dataset, batch_size=batch_size, pin_memory=True, num_workers=8, drop_last=True
     )
 
     val_dataset = StreamingDataset(
-        input_dir="data/slimpajama/val",
+        input_dir="../data/pubmed/processed/val",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         # Consider setting to False, but we would lose some samples due to truncation when world size > 1
         drop_last=True,
     )
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, pin_memory=True, num_workers=8, drop_last=True)
+    return train_dataloader, val_dataloader
+
+
+train_data_config = [
+    ('train', 1.0)
+]
+
+val_data_config = [
+    ("val", 1.0),
+]
+
+def create_dataloader(
+    batch_size: int, block_size: int, data_dir: Path, fabric, shuffle: bool = True, seed: int = 12345, split="train"
+) -> DataLoader:
+
+    datasets = []
+    data_config = train_data_config if split == "train" else val_data_config
+    for prefix, _ in data_config:
+        filenames = sorted(glob.glob(str(data_dir / f"{prefix}*")))
+        random.seed(seed)
+        random.shuffle(filenames)
+
+        dataset = PackedDataset(
+            filenames,
+            # n_chunks control the buffer size. 
+            # Note that the buffer size also impacts the random shuffle
+            # (PackedDataset is an IterableDataset. So the shuffle is done by prefetch a buffer and shuffle the buffer)
+            n_chunks=8,
+            block_size=block_size,
+            shuffle=shuffle,
+            seed=seed+fabric.global_rank,
+            num_processes=fabric.world_size,
+            process_rank=fabric.global_rank,
+        )
+        datasets.append(dataset)
+
+    if not datasets:
+        raise RuntimeError(
+            f"No data found at {data_dir}. Make sure you ran prepare_redpajama.py to create the dataset."
+        )
+
+    weights = [weight for _, weight in data_config]
+    sum_weights = sum(weights)
+    weights = [el / sum_weights for el in weights]
+
+    combined_dataset = CombinedDataset(datasets=datasets, seed=seed, weights=weights)
+
+    return DataLoader(combined_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
+
+
+def create_dataloaders(
+    batch_size: int,
+    block_size: int,
+    fabric,
+    train_data_dir: Path = Path("../data/pubmed/processed/train"),
+    val_data_dir: Optional[Path] = Path("../data/pubmed/processed/val"),
+    seed: int = 12345,
+) -> Tuple[DataLoader, DataLoader]:
+
+    # Increase by one because we need the next word as well
+    effective_block_size = block_size + 1
+    train_dataloader = create_dataloader(
+        batch_size=batch_size,
+        block_size=effective_block_size,
+        fabric=fabric,
+        data_dir=train_data_dir,
+        shuffle=True,
+        seed=seed,
+        split="train"
+    )
+    val_dataloader = (
+        create_dataloader(
+            batch_size=batch_size,
+            block_size=effective_block_size,
+            fabric=fabric,
+            data_dir=val_data_dir,
+            shuffle=False,
+            seed=seed,
+            split="validation"
+        )
+        if val_data_dir
+        else None
+    )
     return train_dataloader, val_dataloader
 
 
@@ -335,7 +444,7 @@ def choose_logger(logger_name: str, name: str, resume: Union[bool, Path], *args,
     if logger_name == "tensorboard":
         return TensorBoardLogger(root_dir=(out_dir / "logs"), name="tensorboard", *args, **kwargs)
     if logger_name == "wandb":
-        return WandbLogger(project="tinyllama", name=name, resume=(resume is not False), *args, **kwargs)
+        return WandbLogger(project="adapt-lm", name=name, resume=(resume is not False), *args, **kwargs)
     raise ValueError(f"`logger={logger_name}` is not a valid option.")
 
 
@@ -345,7 +454,7 @@ if __name__ == "__main__":
     from jsonargparse import CLI
     from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_2_2
 
-    if not _TORCH_GREATER_EQUAL_2_2:
-        raise ImportError("The tinyllama.py training script requires PyTorch 2.2 (nightly) or higher to run.")
+    # if not _TORCH_GREATER_EQUAL_2_2:
+        # raise ImportError("The tinyllama.py training script requires PyTorch 2.2 (nightly) or higher to run.")
 
     CLI(setup)
