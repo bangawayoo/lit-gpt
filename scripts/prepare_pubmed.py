@@ -101,56 +101,56 @@ def prepare(
 
     num_processes = cpu_count()
     # evenly split data points by number of processes
-    # print(f"Evenly splitting dataset by processes...")
-    # start_time = time.time()
-    # json_writers = [open(os.path.join(destination_path, f"process{process}.jsonl"), "w") for process in range(num_processes)]
-    # idx = 0
-    # for fn in filenames:
-    #     with open(fn, "r") as reader:
-    #         for line_idx, line in enumerate(reader):
-    #             try:
-    #                 json_line = json.loads(line)
-    #                 process_id = idx % num_processes
-    #                 json_writer = json_writers[process_id]
-    #                 write_to_jsonl(json_line, json_writer)
-    #                 idx += 1
-    #             except Exception as e:
-    #                 print(e)
-    #                 breakpoint()
-    #                 print(f"Error reading {fn} idx={line_idx}")
-    #                 continue
+    print(f"Evenly splitting dataset by processes...")
+    start_time = time.time()
+    json_writers = [open(os.path.join(destination_path, f"process{process}.jsonl"), "w") for process in range(num_processes)]
+    idx = 0
+    for fn in filenames:
+        with open(fn, "r") as reader:
+            for line_idx, line in enumerate(reader):
+                try:
+                    json_line = json.loads(line)
+                    process_id = idx % num_processes
+                    json_writer = json_writers[process_id]
+                    write_to_jsonl(json_line, json_writer)
+                    idx += 1
+                except Exception as e:
+                    print(e)
+                    breakpoint()
+                    print(f"Error reading {fn} idx={line_idx}")
+                    continue
 
-    # for wr in json_writers:
-    #     wr.close()
-    # end_time = time.time()
-    # elapsed_time = end_time - start_time
-    # print(f"Time taken: {elapsed_time:.2f} seconds")
+    for wr in json_writers:
+        wr.close()
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Time taken: {elapsed_time:.2f} seconds")
 
 
 
-    # # start chunking the dataset for each process
-    # print("Chunking dataset by blocks...")
-    # chunked_filenames = [os.path.join(destination_path, f"process{process}.jsonl") for process in range(num_processes)]
-    # chunked_filenames = np.array_split(chunked_filenames, num_processes)
-    # print(chunked_filenames)
-    # processes = []
-    # start_time = time.time()
+    # start chunking the dataset for each process
+    print("Chunking dataset by blocks...")
+    chunked_filenames = [os.path.join(destination_path, f"process{process}.jsonl") for process in range(num_processes)]
+    chunked_filenames = np.array_split(chunked_filenames, num_processes)
+    print(chunked_filenames)
+    processes = []
+    start_time = time.time()
 
-    # DEBUG = False
-    # if DEBUG:
-    #     prepare_full(source_path, checkpoint_dir, destination_path, chunk_size, list(chunked_filenames[0]), 0)
-    #     exit()
+    DEBUG = False
+    if DEBUG:
+        prepare_full(source_path, checkpoint_dir, destination_path, chunk_size, list(chunked_filenames[0]), 0)
+        exit()
 
-    # for i, subset in enumerate(chunked_filenames):
-    #     p = Process(target=prepare_full, args=(source_path, checkpoint_dir, destination_path, chunk_size, list(subset), i))
-    #     processes.append(p)
-    #     p.start()
+    for i, subset in enumerate(chunked_filenames):
+        p = Process(target=prepare_full, args=(source_path, checkpoint_dir, destination_path, chunk_size, list(subset), i))
+        processes.append(p)
+        p.start()
 
-    # for p in processes:
-    #     p.join()
-    # end_time = time.time()
-    # elapsed_time = end_time - start_time
-    # print(f"Time taken: {elapsed_time:.2f} seconds")
+    for p in processes:
+        p.join()
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Time taken: {elapsed_time:.2f} seconds")
 
     # create file 
     os.makedirs(os.path.join(destination_path, "val"), exist_ok=True)
